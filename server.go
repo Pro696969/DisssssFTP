@@ -2,25 +2,74 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
 
-// In-memory store for authenticated sessions
-var authenticatedSessions = make(map[string]net.Conn)
-var mu sync.Mutex
-var listener net.Listener
+var (
+	authenticatedSessions = make(map[string]net.Conn)
+	mu                    sync.Mutex
+	listener              net.Listener
+)
 
-// Timeout duration for idle connections
-const idleTimeout = 5 * time.Minute
+const (
+	idleTimeout = 5 * time.Minute
+	baseDir     = "./uploads"
+	credentials = "id_passwd.txt"
+)
 
-// Function to read the credentials from the file
+func main() {
+	// Ensure base upload directory exists
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		log.Fatalf("Error creating base upload directory: %v", err)
+	}
+
+	credentials, err := readCredentials(credentials)
+	if err != nil {
+		log.Fatalf("Error reading credentials: %v", err)
+	}
+
+	listener, err = net.Listen("tcp", ":8080")
+	if err != nil {
+		log.Fatalf("Error starting server: %v", err)
+	}
+	defer listener.Close()
+
+	log.Println("TCP server is listening on port 8080...")
+
+	var wg sync.WaitGroup
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
+
+	// Handle shutdown gracefully
+	// it is now a seperate func
+	go handleShutdown(signalChannel, &wg)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				break
+			}
+			log.Printf("Error accepting connection: %v", err)
+			continue
+		}
+
+		wg.Add(1)
+		go handleConnection(conn, credentials, &wg)
+	}
+}
+
 func readCredentials(filePath string) (map[string]string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -45,13 +94,21 @@ func handleConnection(conn net.Conn, credentials map[string]string, wg *sync.Wai
 	defer conn.Close()
 
 	// Authentication process
-	authenticated := authenticate(conn, credentials)
-	if !authenticated {
+	username := authenticate(conn, credentials)
+	if username == "" {
 		conn.Write([]byte("Incorrect username or password. Disconnecting.\n"))
 		return
 	}
 
-	// After authentication, persist session
+	log.Printf("Client %s connected", username)
+	// Create a unique directory for the authenticated user
+	clientDir := filepath.Join(baseDir, username)
+	if err := os.MkdirAll(clientDir, 0755); err != nil {
+		log.Printf("Error creating directory for %s: %v", username, err)
+		return
+	}
+
+	// Persist session in authenticatedSessions map
 	clientAddr := conn.RemoteAddr().String()
 	mu.Lock()
 	authenticatedSessions[clientAddr] = conn
@@ -63,124 +120,415 @@ func handleConnection(conn net.Conn, credentials map[string]string, wg *sync.Wai
 		mu.Unlock()
 	}()
 
-	conn.Write([]byte("Authentication successful. You are now connected.\n"))
-
-	// Reading the data from the client within the idle timeout limit
-	buf := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(idleTimeout))
-
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			if strings.Contains(err.Error(), "connection reset by peer") {
-				log.Printf("Connection closed by client: %s\n", clientAddr)
-			} else if strings.Contains(err.Error(), "i/o timeout") {
-				log.Printf("Connection timed out: %s\n", clientAddr)
-			} else {
-				log.Printf("Disconnected due to: %v from %s\n", err, clientAddr)
-			}
-			return
-		}
-
-		// Resetting the deadline after every successful read
-		conn.SetReadDeadline(time.Now().Add(idleTimeout))
-
-		log.Printf("Received from %s: %s\n", clientAddr, strings.TrimSpace(string(buf[:n])))
-		conn.Write([]byte("Data received.\n"))
+	if _, err := conn.Write([]byte("Authentication successful. You are now connected.\n")); err != nil {
+		log.Printf("Error writing authentication success message: %v", err)
+		return
 	}
+
+	handleClientOperations(conn, username, clientDir)
 }
 
 // Authentication function to validate the client credentials
-func authenticate(conn net.Conn, credentials map[string]string) bool {
+func authenticate(conn net.Conn, credentials map[string]string) string {
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
 		log.Println("Error reading credentials:", err)
-		return false
+		conn.Write([]byte("Authentication failed: Error reading credentials\n"))
+		return ""
 	}
 
 	input := strings.TrimSpace(string(buf[:n]))
 	parts := strings.Split(input, ":")
 	if len(parts) != 2 {
 		conn.Write([]byte("Invalid format. Use username:password format.\n"))
-		return false
+		return ""
 	}
 
 	username, password := parts[0], parts[1]
 	if storedPassword, ok := credentials[username]; ok && storedPassword == password {
-		return true
+		return username
 	}
-	return false
+
+	conn.Write([]byte("Authentication failed: Invalid credentials\n"))
+	log.Printf("Failed authentication attempt for user: %s", username)
+	return ""
 }
 
-func main() {
-	// Create a WaitGroup to track active connections
-	var wg sync.WaitGroup
+func handleClientOperations(conn net.Conn, username, clientDir string) {
+	reader := bufio.NewReader(conn)
 
-	// Set up signal handling
-	signalChannel := make(chan os.Signal, 1)
-	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
-
-	// Read credentials
-	credentials, err := readCredentials("id_passwd.txt")
-	if err != nil {
-		log.Println("Error reading credentials:", err)
-		os.Exit(1)
-	}
-
-	// Start server
-	listener, err = net.Listen("tcp", ":9090")
-	if err != nil {
-		log.Fatalf("Error starting server: %v", err)
-	}
-	log.Println("TCP server is listening on port 9090...")
-
-	// Channel to signal the accept loop to stop
-	done := make(chan struct{})
-
-	// Accept connections in a separate goroutine
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				conn, err := listener.Accept()
-				if err != nil {
-					if !strings.Contains(err.Error(), "use of closed network connection") {
-						log.Printf("Error accepting connection: %v", err)
-					}
-					continue
-				}
-				wg.Add(1)
-				go handleConnection(conn, credentials, &wg)
-			}
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
+			log.Printf("Error setting read deadline: %v", err)
+			return
 		}
-	}()
 
-	// Wait for shutdown signal
-	<-signalChannel
-	log.Println("Interrupt signal received. Starting graceful shutdown...")
+		opType, err := reader.ReadByte()
+		if err != nil {
+			if err == io.EOF || strings.Contains(err.Error(), "connection reset by peer") {
+				log.Printf("Client %s disconnected", username)
+				return
+			}
+			log.Printf("Error reading operation type from %s: %v", username, err)
+			return
+		}
 
-	// Close the listener first to stop accepting new connections
-	if err := listener.Close(); err != nil {
-		log.Printf("Error closing listener: %v", err)
+		switch opType {
+		case 1: // File upload
+			// Read filename length
+			var fileNameLen int32
+			if err := binary.Read(reader, binary.LittleEndian, &fileNameLen); err != nil {
+				log.Printf("Error reading filename length: %v", err)
+				return
+			}
+
+			// Read filename
+			fileNameBuf := make([]byte, fileNameLen)
+			if _, err := io.ReadFull(reader, fileNameBuf); err != nil {
+				log.Printf("Error reading filename: %v", err)
+				return
+			}
+			fileName := string(fileNameBuf)
+
+			// Read file size
+			var fileSize int64
+			if err := binary.Read(reader, binary.LittleEndian, &fileSize); err != nil {
+				log.Printf("Error reading file size: %v", err)
+				return
+			}
+
+			if err := handleFileUpload(conn, filepath.Join(clientDir, fileName), fileSize, username); err != nil {
+				log.Printf("Error handling file upload: %v", err)
+				return
+			}
+			reader.Reset(conn)
+
+		case 2: // File download
+			if err := handleFileDownload(conn, username); err != nil {
+				log.Printf("Error handling file download for %s: %v", username, err)
+				return
+			}
+
+		case 3: //View files
+			var fileNameLen int32
+			if err := binary.Read(reader, binary.LittleEndian, &fileNameLen); err != nil {
+				log.Printf("Error reading filename length: %v", err)
+				return
+			}
+
+			fileNameBuf := make([]byte, fileNameLen)
+			if _, err := io.ReadFull(reader, fileNameBuf); err != nil {
+				log.Printf("Error reading filename: %v", err)
+				return
+			}
+			fileName := string(fileNameBuf)
+
+			if err := handleViewFile(conn, filepath.Join(clientDir, fileName), username); err != nil {
+				log.Printf("Error handling file view: %v", err)
+				return
+			}
+			reader.Reset(conn)
+
+		case 4: // Delete file(s)
+			if err := handleFileDeletion(reader, conn, username); err != nil {
+				log.Printf("Error handling file deletion for %s: %v", username, err)
+				return
+			}
+			reader.Reset(conn)
+
+		case 5: // List files
+			if err := handleListFiles(conn, clientDir); err != nil {
+				log.Printf("Error handling list files for %s: %v", username, err)
+				return
+			}
+			reader.Reset(conn) // Reset reader after operation
+
+		default:
+			log.Printf("Unknown operation type %d from %s", opType, username)
+			return
+		}
+	}
+}
+
+func handleFileUpload(conn net.Conn, filePath string, fileSize int64, username string) error {
+	file, err := os.Create(filePath)
+	if err != nil {
+		conn.Write([]byte("Error: Failed to create file\n"))
+		return err
+	}
+	defer file.Close()
+
+	// Read file content with a buffered reader
+	reader := bufio.NewReader(conn)
+	bytesReceived := int64(0)
+	buf := make([]byte, 1024)
+
+	for bytesReceived < fileSize {
+		n, err := reader.Read(buf)
+		if err != nil && err != io.EOF {
+			conn.Write([]byte("Error: Failed to receive file\n"))
+			os.Remove(filePath)
+			return err
+		}
+
+		if n > 0 {
+			if _, err := file.Write(buf[:n]); err != nil {
+				conn.Write([]byte("Error: Failed to write file\n"))
+				os.Remove(filePath)
+				return err
+			}
+			bytesReceived += int64(n)
+		}
+
+		if err == io.EOF {
+			break
+		}
 	}
 
-	// Signal the accept loop to stop
-	close(done)
+	log.Printf("File %s received from %s (%d bytes)", filepath.Base(filePath), username, bytesReceived)
 
-	// Close all existing connections
+	// Send acknowledgment with newline
+	if _, err := conn.Write([]byte("Done\n")); err != nil {
+		return fmt.Errorf("error sending acknowledgment: %v", err)
+	}
+
+	return nil
+}
+
+func handleFileDownload(conn net.Conn, username string) error {
+	var fileNameLen int32
+	if err := binary.Read(conn, binary.LittleEndian, &fileNameLen); err != nil {
+		return fmt.Errorf("error reading filename length: %v", err)
+	}
+
+	fileNameBytes := make([]byte, fileNameLen)
+	if _, err := io.ReadFull(conn, fileNameBytes); err != nil {
+		return fmt.Errorf("error reading filename: %v", err)
+	}
+	fileName := string(fileNameBytes)
+
+	filePath := filepath.Join("uploads", username, fileName)
+	file, err := os.Open(filePath)
+	if err != nil {
+		// File doesn't exist or other error
+		// Send error status (0) followed by error message
+		if err := binary.Write(conn, binary.LittleEndian, int64(0)); err != nil {
+			return fmt.Errorf("error sending error status: %v", err)
+		}
+		errMsg := fmt.Sprintf("File %s does not exist", fileName)
+		errMsgLen := int32(len(errMsg))
+		if err := binary.Write(conn, binary.LittleEndian, errMsgLen); err != nil {
+			return fmt.Errorf("error sending error message length: %v", err)
+		}
+		if _, err := conn.Write([]byte(errMsg)); err != nil {
+			return fmt.Errorf("error sending error message: %v", err)
+		}
+		fmt.Printf("Client requested non-existent file: %s\n", fileName)
+		return nil
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("error getting file info: %v", err)
+	}
+
+	// Send file size (positive number indicates success)
+	fileSize := fileInfo.Size()
+	if err := binary.Write(conn, binary.LittleEndian, fileSize); err != nil {
+		return fmt.Errorf("error sending file size: %v", err)
+	}
+
+	buf := make([]byte, 1024)
+	bytesSent := int64(0)
+	for {
+		n, err := file.Read(buf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("error reading file: %v", err)
+		}
+
+		if _, err := conn.Write(buf[:n]); err != nil {
+			return fmt.Errorf("error sending file content: %v", err)
+		}
+		bytesSent += int64(n)
+	}
+
+	log.Printf("File '%s' successfully downloaded by user '%s' (%d bytes)\n", fileName, username, bytesSent)
+	return nil
+}
+
+func handleListFiles(conn net.Conn, clientDir string) error {
+	files, err := os.ReadDir(clientDir)
+	if err != nil {
+		log.Printf("Error reading directory: %v", err)
+		return err
+	}
+
+	// Send file count
+	fileCount := int32(len(files))
+	if err := binary.Write(conn, binary.LittleEndian, fileCount); err != nil {
+		return fmt.Errorf("error sending file count: %v", err)
+	}
+
+	// Send file information
+	for _, file := range files {
+		info, err := file.Info()
+		if err != nil {
+			continue
+		}
+
+		// Send filename length
+		fileNameLen := int32(len(file.Name()))
+		if err := binary.Write(conn, binary.LittleEndian, fileNameLen); err != nil {
+			return fmt.Errorf("error sending filename length: %v", err)
+		}
+
+		// Send filename
+		if _, err := conn.Write([]byte(file.Name())); err != nil {
+			return fmt.Errorf("error sending filename: %v", err)
+		}
+
+		// Send file size
+		if err := binary.Write(conn, binary.LittleEndian, info.Size()); err != nil {
+			return fmt.Errorf("error sending file size: %v", err)
+		}
+
+		// Send modification time
+		modTime := info.ModTime().Unix()
+		if err := binary.Write(conn, binary.LittleEndian, modTime); err != nil {
+			return fmt.Errorf("error sending modification time: %v", err)
+		}
+	}
+
+	if _, err := conn.Write([]byte{0xFF}); err != nil {
+		return fmt.Errorf("error sending completion acknowledgment: %v", err)
+	}
+
+	return nil
+}
+
+func handleViewFile(conn net.Conn, filePath string, username string) error {
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if _, err := conn.Write([]byte{0}); err != nil {
+				return fmt.Errorf("error sending not found status: %v", err)
+			}
+			log.Printf("User %s attempted to view non-existent file: %s", username, filepath.Base(filePath))
+			return nil
+		}
+		conn.Write([]byte{0})
+		log.Printf("Error checking file for user %s: %s - %v", username, filepath.Base(filePath), err)
+		return fmt.Errorf("error checking file: %v", err)
+	}
+
+	log.Printf("User %s is viewing file: %s (size %d bytes)", username, filepath.Base(filePath), fileInfo.Size())
+
+	if _, err := conn.Write([]byte{1}); err != nil {
+		return fmt.Errorf("error sending status: %v", err)
+	}
+
+	// Send file size
+	if err := binary.Write(conn, binary.LittleEndian, fileInfo.Size()); err != nil {
+		return fmt.Errorf("error sending file size: %v", err)
+	}
+
+	// Read file
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("error opening file: %v", err)
+	}
+	defer file.Close()
+
+	// Send file content
+	buf := make([]byte, 1024)
+	n, err := file.Read(buf)
+	if err != nil {
+		return fmt.Errorf("error reading file: %v", err)
+	}
+
+	if _, err := conn.Write(buf[:n]); err != nil {
+		return fmt.Errorf("error sending file content: %v", err)
+	}
+
+	log.Printf("Successfully viewing file %s to user %s", filepath.Base(filePath), username)
+	return nil
+}
+
+func handleFileDeletion(reader *bufio.Reader, conn net.Conn, username string) error {
+    // Read filename length
+    var fileNameLen int32
+    if err := binary.Read(reader, binary.LittleEndian, &fileNameLen); err != nil {
+        return fmt.Errorf("error reading filename length: %v", err)
+    }
+
+    // Read filename
+    fileNameBytes := make([]byte, fileNameLen)
+    if _, err := io.ReadFull(reader, fileNameBytes); err != nil {
+        return fmt.Errorf("error reading filename: %v", err)
+    }
+    fileName := string(fileNameBytes)
+
+	// Check for invalid filename
+	if strings.Contains(fileName, "..") {
+		if _, err := conn.Write([]byte{0}); err != nil {
+			return fmt.Errorf("error sending invalid filename status: %v", err)
+		}
+		log.Printf("Invalid filename '%s' attempted by user '%s'", fileName, username)
+		return fmt.Errorf("invalid filename: %s", fileName)
+	}
+
+    // Build file path
+    filePath := filepath.Join(baseDir, username, fileName)
+
+    // Lock before deleting
+    mu.Lock()
+    defer mu.Unlock()
+
+    // Attempt to delete the file
+    if _, err := os.Stat(filePath); err == nil {
+        // File exists, proceed to delete
+        if err := os.Remove(filePath); err != nil {
+            // Send failure response
+            if _, err := conn.Write([]byte{0}); err != nil {
+                return fmt.Errorf("error sending failure status: %v", err)
+            }
+            return fmt.Errorf("error deleting file: %v", err)
+        }
+        // Send success response
+        if _, err := conn.Write([]byte{1}); err != nil {
+            return fmt.Errorf("error sending success status: %v", err)
+        }
+        log.Printf("File '%s' deleted by user '%s'", fileName, username)
+    } else {
+        // File does not exist
+        if _, err := conn.Write([]byte{0}); err != nil {
+            return fmt.Errorf("error sending failure status: %v", err)
+        }
+        log.Printf("File '%s' not found for user '%s'", fileName, username)
+    }
+
+    return nil
+}
+
+
+func handleShutdown(signalChannel chan os.Signal, wg *sync.WaitGroup) {
+	<-signalChannel
+	fmt.Print("\r")
+	log.Println("Ctrl+C encountered. Shutting down server...")
+	listener.Close()
+
 	mu.Lock()
-	for addr, conn := range authenticatedSessions {
-		log.Printf("Closing connection from %s\n", addr)
+	for _, conn := range authenticatedSessions {
 		conn.Close()
 	}
 	mu.Unlock()
 
-	// Wait for all connections to finish
-	log.Println("Waiting for all connections to close...")
 	wg.Wait()
-
-	log.Println("Server shutdown completed")
+	log.Println("Server shutdown complete")
+	os.Exit(0)
 }

@@ -1,4 +1,8 @@
 test
-claudeai
-client/go.mod
+/uploads
+test*
+/testing
+client/Downloads/
+client/test*
 go.mod
+client/go.mod
