@@ -1,5 +1,8 @@
 # Distributed File Orchestration and Synchronization: Multi-Node Data-Transfer-Framework for Linux
 
+## DEMO 
+<video src="./Files/DEMO.mp4" DEMO></video>
+
 ## Introduction
 
 This system facilitates secure file transfer operations between clients and a server over TCP. It supports authentication, multiple file operations, and lays the groundwork for future enhancements like encryption.
