@@ -1,7 +1,7 @@
 # Distributed File Orchestration and Synchronization: Multi-Node Data-Transfer-Framework for Linux
 
 ## DEMO 
-<video src="./Files/DEMO.mp4" DEMO></video>
+https://github.com/user-attachments/assets/463c8433-b1b8-4d68-a3d6-b61f1debabf9
 
 ## Introduction
 
